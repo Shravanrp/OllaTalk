@@ -46,35 +46,36 @@ class OllamaEngine:
     Manages conversation history and streaming responses.
     """
     def __init__(self, config: AgentConfig):
-        self.client = AsyncClient()
+        self.client = AsyncClient(host=config.base_url)
         self.config = config
         self.history: List[Dict[str, str]] = []
-        self.total_tokens_used : int = 0
+        self.total_tokens_used: int = 0
 
-        # Initialize history with system prompt
+        # Initialize with system prompt
         if self.config.system_prompt:
-            self.history.append({"role": "system", "content": self.config.system_prompt})
+            self.history.append({
+                "role": "system",
+                "content": self.config.system_prompt
+            })
 
+        # Load previous history if file exists
         if self.config.history_file and self.config.history_file.exists():
             self.load_history()
 
-
-    #GuardRail to check if the model is available or not
     async def check_model_availability(self) -> bool:
-            """Check if the configured model is available."""
-            try:
-                models = await self.client.list()
-                available_models = [model['name'] for model in models['models']]
-                if self.config.model_name not in available_models:
-                    logger.warning(f"Model {self.config.model_name} not found. Available: {available_models}")
-                    return False
-                return True
-            except Exception as e:
-                logger.error(f"Error checking models: {e}")
+        """Check if the configured model is available."""
+        try:
+            models = await self.client.list()
+            available_models = [model['name'] for model in models['models']]
+            if self.config.model_name not in available_models:
+                logger.warning(f"Model {self.config.model_name} not found. Available: {available_models}")
                 return False
+            return True
+        except Exception as e:
+            logger.error(f"Error checking models: {e}")
+            return False
 
-
-    async def stream_response(self, user_input: str) -> AsyncGenerator[str, None]:
+    async def stream_response(self,user_input: str,stream: bool = True) -> AsyncGenerator[str, None]:
         """
         Sends input to Ollama and yields chunks of text as they generated.
         Updates internal history automatically.
@@ -82,32 +83,133 @@ class OllamaEngine:
         # Add user message to history
         self.history.append({"role": "user", "content": user_input})
 
+        # Manage context length (optional trimming)
+        self._manage_context_length()
+
         full_response_buffer = ""
 
         try:
-            # Create the chat completion stream
-            async for part in await self.client.chat(
-                model=self.config.model_name,
-                messages=self.history,
-                stream=True,
-                options={"temperature": self.config.temperature}
-            ):
-                token = part['message']['content']
-                full_response_buffer += token
-                yield token
+            # Prepare options
+            options = {
+                "temperature": self.config.temperature,
+                "top_p": self.config.top_p,
+                "top_k": self.config.top_k,
+            }
+
+            if self.config.num_predict:
+                options["num_predict"] = self.config.num_predict
+            if self.config.seed:
+                options["seed"] = self.config.seed
+
+            # Create the chat completion
+            if stream:
+                response = await self.client.chat(
+                    model=self.config.model_name,
+                    messages=self.history,
+                    stream=True,
+                    options=options
+                )
+
+                async for part in response:
+                    token = part['message']['content']
+                    full_response_buffer += token
+                    yield token
+
+                    # Keep track of tokens (approximate)
+                    self.total_tokens_used += 1
+            else:
+                # Non-streaming response for when you need the complete response
+                response = await self.client.chat(
+                    model=self.config.model_name,
+                    messages=self.history,
+                    stream=False,
+                    options=options
+                )
+                full_response_buffer = response['message']['content']
+                self.total_tokens_used += len(full_response_buffer.split())
+                yield full_response_buffer
 
             # Once stream finishes, append full assistant response to history
-            self.history.append({"role": "assistant", "content": full_response_buffer})
+            self.history.append({
+                "role": "assistant",
+                "content": full_response_buffer
+            })
+
+            # Save history if configured
+            if self.config.history_file:
+                self.save_history()
 
         except ResponseError as e:
-            yield f"\n[!] Ollama API Error: {e.error}"
+            error_msg = f"\n[!] Ollama API Error: {e.error}"
+            logger.error(error_msg)
+            yield error_msg
+        except asyncio.CancelledError:
+            logger.info("Stream cancelled by user")
+            yield "\n\n[Response interrupted]"
+            raise
         except Exception as e:
-            yield f"\n[!] Unexpected Error: {str(e)}"
+            error_msg = f"\n[!] Unexpected Error: {str(e)}"
+            logger.exception("Unexpected error in stream_response")
+            yield error_msg
+
+    def _manage_context_length(self):
+        """Trim history if it exceeds context length (simple implementation)."""
+        if len(self.history) > self.config.context_length:
+            # Keep system message and last N messages
+            system_msg = [msg for msg in self.history if msg["role"] == "system"]
+            recent_messages = self.history[-50:]  # Keep last 50 exchanges
+            self.history = system_msg + recent_messages
+            logger.info("Trimmed conversation history")
 
     def clear_memory(self):
-        """Resets the conversation history."""
-        self.history = [x for x in self.history if x["role"] == "system"]
-        print("\n--- Memory Cleared ---\n")
+        """Resets the conversation history while keeping system prompt."""
+        system_messages = [msg for msg in self.history if msg["role"] == "system"]
+        self.history = system_messages
+        logger.info("Memory cleared")
+        return True
+
+    def save_history(self):
+        """Save conversation history to file."""
+        if not self.config.history_file:
+            return
+
+        try:
+            history_data = {
+                "timestamp": datetime.now().isoformat(),
+                "model": self.config.model_name,
+                "history": self.history,
+                "total_tokens": self.total_tokens_used
+            }
+
+            with open(self.config.history_file, 'w') as f:
+                json.dump(history_data, f, indent=2)
+            logger.info(f"History saved to {self.config.history_file}")
+        except Exception as e:
+            logger.error(f"Failed to save history: {e}")
+
+    def load_history(self):
+        """Load conversation history from file."""
+        try:
+            with open(self.config.history_file, 'r') as f:
+                data = json.load(f)
+                self.history = data.get('history', [])
+                self.total_tokens_used = data.get('total_tokens', 0)
+            logger.info(f"History loaded from {self.config.history_file}")
+        except Exception as e:
+            logger.error(f"Failed to load history: {e}")
+
+    def get_conversation_stats(self) -> Dict[str, Any]:
+        """Get statistics about the current conversation."""
+        user_messages = sum(1 for msg in self.history if msg["role"] == "user")
+        assistant_messages = sum(1 for msg in self.history if msg["role"] == "assistant")
+
+        return {
+            "total_messages": len(self.history) - 1,  # Exclude system
+            "user_messages": user_messages,
+            "assistant_messages": assistant_messages,
+            "total_tokens_used": self.total_tokens_used,
+            "current_context_length": len(self.history)
+        }
 
 # --- Main Application Loop ---
 async def main():
