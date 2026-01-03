@@ -1,8 +1,24 @@
 import asyncio
 import sys
-from typing import List, Dict, AsyncGenerator, Optional
+from typing import (
+    List,
+    Dict,
+    AsyncGenerator,
+    Optional
+)
 from dataclasses import dataclass, field
 from ollama import AsyncClient, ResponseError
+import logging
+from pathlib import Path
+
+
+logging.basicConfig(
+    level = logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+logger = logging.getLogger(__name__)
+
 
 # --- Configuration ---
 @dataclass
@@ -11,6 +27,17 @@ class AgentConfig:
     model_name: str = "llama3.2"  # Change to your installed model (e.g., mistral, llama3)
     system_prompt: str = "You are a helpful, precise AI assistant. Answer concisely."
     temperature: float = 0.7
+    base_url = "http://localhost:111111" #change it according to the user's llm configuration and compatibility
+    top_p: float = 0.9
+
+    #are to be set for more feature configurations
+    top_k: int = 40
+    num_predict: Optional[int] = None  # Max tokens to generate
+    seed: Optional[int] = None         # For reproducibility
+    keep_alive: str = "5m"             # Time for how long to keep model loaded
+    context_length: int = 4096         # For history management or user's preference
+    history_file: Optional[Path] = None
+
 
 # --- The Engine ---
 class OllamaEngine:
@@ -22,10 +49,16 @@ class OllamaEngine:
         self.client = AsyncClient()
         self.config = config
         self.history: List[Dict[str, str]] = []
-        
+        self.total_tokens_used : int = 0
+
         # Initialize history with system prompt
         if self.config.system_prompt:
             self.history.append({"role": "system", "content": self.config.system_prompt})
+
+        if self.config.history_file and self.config.history_file.exists():
+            self.load_history()
+
+
 
     async def stream_response(self, user_input: str) -> AsyncGenerator[str, None]:
         """
@@ -34,7 +67,7 @@ class OllamaEngine:
         """
         # Add user message to history
         self.history.append({"role": "user", "content": user_input})
-        
+
         full_response_buffer = ""
 
         try:
@@ -67,7 +100,7 @@ async def main():
     # 1. Setup
     config = AgentConfig(model_name="llama3.2") # Ensure this model is pulled in Ollama
     agent = OllamaEngine(config)
-    
+
     print(f"--- Advanced Ollama Client (Model: {config.model_name}) ---")
     print("Type 'exit' to quit or 'clear' to reset memory.\n")
 
@@ -75,26 +108,26 @@ async def main():
     while True:
         try:
             user_input = input(">>> ").strip()
-            
+
             if not user_input:
                 continue
-            
+
             if user_input.lower() in ["exit", "quit"]:
                 print("Goodbye.")
                 break
-            
+
             if user_input.lower() == "clear":
                 agent.clear_memory()
                 continue
 
             # 3. Output Handling (Streaming)
             print("Response: ", end="", flush=True)
-            
+
             async for chunk in agent.stream_response(user_input):
                 # Print directly to stdout without newline to create typing effect
                 sys.stdout.write(chunk)
                 sys.stdout.flush()
-            
+
             print("\n")  # Newline after response completes
 
         except KeyboardInterrupt:
