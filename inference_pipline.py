@@ -6,6 +6,8 @@ from typing import (
     AsyncGenerator,
     Optional
 )
+import json
+import datetime
 from dataclasses import dataclass, field
 from ollama import AsyncClient, ResponseError
 import logging
@@ -27,7 +29,7 @@ class AgentConfig:
     model_name: str = "llama3.2"  # Change to your installed model (e.g., mistral, llama3)
     system_prompt: str = "You are a helpful, precise AI assistant. Answer concisely."
     temperature: float = 0.7
-    base_url = "http://localhost:111111" #change it according to the user's llm configuration and compatibility
+    base_url = "http://localhost:11111" #change it according to the user's llm configuration and compatibility
     top_p: float = 0.9
 
     #are to be set for more feature configurations
@@ -51,14 +53,14 @@ class OllamaEngine:
         self.history: List[Dict[str, str]] = []
         self.total_tokens_used: int = 0
 
-        # Initialize with system prompt
+        # init the system prompt
         if self.config.system_prompt:
             self.history.append({
                 "role": "system",
                 "content": self.config.system_prompt
             })
 
-        # Load previous history if file exists
+        # loading the history file if it is saved
         if self.config.history_file and self.config.history_file.exists():
             self.load_history()
 
@@ -80,16 +82,16 @@ class OllamaEngine:
         Sends input to Ollama and yields chunks of text as they generated.
         Updates internal history automatically.
         """
-        # Add user message to history
+        # appending history
         self.history.append({"role": "user", "content": user_input})
 
-        # Manage context length (optional trimming)
+        # manage context length
         self._manage_context_length()
 
         full_response_buffer = ""
 
         try:
-            # Prepare options
+            #optional arguments
             options = {
                 "temperature": self.config.temperature,
                 "top_p": self.config.top_p,
@@ -101,7 +103,7 @@ class OllamaEngine:
             if self.config.seed:
                 options["seed"] = self.config.seed
 
-            # Create the chat completion
+            # chat completion success message
             if stream:
                 response = await self.client.chat(
                     model=self.config.model_name,
@@ -115,10 +117,9 @@ class OllamaEngine:
                     full_response_buffer += token
                     yield token
 
-                    # Keep track of tokens (approximate)
                     self.total_tokens_used += 1
             else:
-                # Non-streaming response for when you need the complete response
+                # non-streaming response
                 response = await self.client.chat(
                     model=self.config.model_name,
                     messages=self.history,
@@ -129,13 +130,13 @@ class OllamaEngine:
                 self.total_tokens_used += len(full_response_buffer.split())
                 yield full_response_buffer
 
-            # Once stream finishes, append full assistant response to history
+            # after stream finishes, append full response to history
             self.history.append({
                 "role": "assistant",
                 "content": full_response_buffer
             })
 
-            # Save history if configured
+            # saving history
             if self.config.history_file:
                 self.save_history()
 
@@ -155,9 +156,8 @@ class OllamaEngine:
     def _manage_context_length(self):
         """Trim history if it exceeds context length (simple implementation)."""
         if len(self.history) > self.config.context_length:
-            # Keep system message and last N messages
             system_msg = [msg for msg in self.history if msg["role"] == "system"]
-            recent_messages = self.history[-50:]  # Keep last 50 exchanges
+            recent_messages = self.history[-50:]  # Keep latest 50 exchanges
             self.history = system_msg + recent_messages
             logger.info("Trimmed conversation history")
 
@@ -204,7 +204,7 @@ class OllamaEngine:
         assistant_messages = sum(1 for msg in self.history if msg["role"] == "assistant")
 
         return {
-            "total_messages": len(self.history) - 1,  # Exclude system
+            "total_messages": len(self.history) - 1,  # except system
             "user_messages": user_messages,
             "assistant_messages": assistant_messages,
             "total_tokens_used": self.total_tokens_used,
@@ -213,46 +213,124 @@ class OllamaEngine:
 
 # --- Main Application Loop ---
 async def main():
-    # 1. Setup
-    config = AgentConfig(model_name="llama3.2") # Ensure this model is pulled in Ollama
+    # congfig setup
+    config = AgentConfig(
+        model_name="llama3.2",
+        history_file=Path("./conversation_history.json"),
+        temperature=0.7,
+        base_url="http://localhost:11111"
+    )
+
     agent = OllamaEngine(config)
 
     print(f"--- Advanced Ollama Client (Model: {config.model_name}) ---")
-    print("Type 'exit' to quit or 'clear' to reset memory.\n")
+    print("Commands: 'exit', 'quit', 'clear', 'stats', 'save', 'load', 'models'")
+    print("Type '/help' for more commands\n")
 
-    # 2. Event Loop
+    # check the guard rail of model  availability
+    if not await agent.check_model_availability():
+        print(f"\n Model '{config.model_name}' may not be available.")
+        print("Available models:")
+        try:
+            models = await agent.client.list()
+            for model in models['models']:
+                print(f"  - {model['name']}")
+        except:
+            print("  (Could not fetch model list)")
+        print("\nContinue anyway? [y/N]: ", end="")
+        if input().lower() != 'y':
+            return
+
+    # event loop
     while True:
         try:
-            user_input = input(">>> ").strip()
+            user_input = input("\n>>> ").strip()
 
             if not user_input:
                 continue
 
+            # command kwargs handling
             if user_input.lower() in ["exit", "quit"]:
-                print("Goodbye.")
+                print("Goodbye!")
                 break
 
-            if user_input.lower() == "clear":
+            elif user_input.lower() == "clear":
                 agent.clear_memory()
+                print("Memory cleared.")
                 continue
 
-            # 3. Output Handling (Streaming)
-            print("Response: ", end="", flush=True)
+            elif user_input.lower() == "stats":
+                stats = agent.get_conversation_stats()
+                print(f"\nConversation Statistics:")
+                print(f"  Total messages: {stats['total_messages']}")
+                print(f"  User messages: {stats['user_messages']}")
+                print(f"  Assistant messages: {stats['assistant_messages']}")
+                print(f"  Estimated tokens used: {stats['total_tokens_used']}")
+                continue
 
-            async for chunk in agent.stream_response(user_input):
-                # Print directly to stdout without newline to create typing effect
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
+            elif user_input.lower() == "save":
+                agent.save_history()
+                continue
 
-            print("\n")  # Newline after response completes
+            elif user_input.lower() == "load":
+                agent.load_history()
+                print("History loaded.")
+                continue
+
+            elif user_input.lower() == "models":
+                try:
+                    models = await agent.client.list()
+                    print("\nAvailable models:")
+                    for model in models['models']:
+                        size_gb = model['size'] / 1e9
+                        print(f"  - {model['name']} ({size_gb:.1f} GB)")
+                except Exception as e:
+                    print(f"Error fetching models: {e}")
+                continue
+
+            elif user_input.lower() == "/help":
+                print("\nAvailable commands:")
+                print("  exit/quit     - Exit the program")
+                print("  clear         - Clear conversation history")
+                print("  stats         - Show conversation statistics")
+                print("  save          - Save conversation history")
+                print("  load          - Load conversation history")
+                print("  models        - List available models")
+                print("  /help         - Show this help message")
+                continue
+
+            # streaming with the cancellation support
+            print("Assistant: ", end="", flush=True)
+
+            try:
+                async for chunk in agent.stream_response(user_input):
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                print()
+
+            except asyncio.CancelledError:
+                print("\n[Response cancelled]")
+                # remove the clutter or unfinished things from history
+                if agent.history and agent.history[-1]["role"] == "assistant":
+                    agent.history.pop()
 
         except KeyboardInterrupt:
-            print("\n\nOperation cancelled by user.")
+            print("\n\nInterrupted. Type 'exit' to quit or continue chatting.")
+            continue
+        except EOFError:
+            print("\n\nGoodbye!")
             break
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            print(f"\n[!] Error: {e}")
+
 
 if __name__ == "__main__":
-    # Run the async main loop
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        print("\n\nProgram terminated.")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        print(f"\nFatal error: {e}")
+        sys.exit(1)
