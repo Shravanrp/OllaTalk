@@ -59,6 +59,20 @@ class OllamaEngine:
             self.load_history()
 
 
+    #GuardRail to check if the model is available or not
+    async def check_model_availability(self) -> bool:
+            """Check if the configured model is available."""
+            try:
+                models = await self.client.list()
+                available_models = [model['name'] for model in models['models']]
+                if self.config.model_name not in available_models:
+                    logger.warning(f"Model {self.config.model_name} not found. Available: {available_models}")
+                    return False
+                return True
+            except Exception as e:
+                logger.error(f"Error checking models: {e}")
+                return False
+
 
     async def stream_response(self, user_input: str) -> AsyncGenerator[str, None]:
         """
